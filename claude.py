@@ -11,82 +11,92 @@ from shapely.ops import linemerge
 from pathlib import Path
 import sys
 
-def is_fsr(road_name):
-    """Check if road name matches FSR patterns"""
-    if pd.isna(road_name):
-        return False
+def filter_fsr_segments(gdf):
+    """Fast filter for FSR segments using vectorized operations"""
+    print("Filtering for FSR segments...")
     
-    road_name = str(road_name).upper()
+    # First filter: ROAD_CLASS must be "resource" 
+    resource_mask = gdf['ROAD_CLASS'] == 'resource'
+    print(f"Found {resource_mask.sum()} segments with ROAD_CLASS='resource'")
     
-    # Common FSR patterns in BC
-    fsr_patterns = [
-        r'.*FSR.*',                    # Contains "FSR"
-        r'.*FOREST.*SERVICE.*ROAD.*',  # "Forest Service Road"
-        r'.*FORESTRY.*ROAD.*',         # "Forestry Road"
-        r'^[A-Z]+\s*\d+\s*FSR$',      # "SMITH 100 FSR"
-        r'^\d+\s*FSR$',               # "1200 FSR"
-        r'.*BRANCH.*FSR.*',           # "West Branch FSR"
-        r'.*CREEK.*FSR.*',            # "Bear Creek FSR"
-        r'.*MAIN.*FSR.*',             # "Slocan Main FSR"
-    ]
+    # Second filter: ROAD_NAME_FULL must contain "FSR"
+    # Use vectorized string operations for speed
+    fsr_mask = gdf['ROAD_NAME_FULL'].str.contains('FSR', case=False, na=False)
     
-    return any(re.match(pattern, road_name) for pattern in fsr_patterns)
+    # Combine both conditions
+    fsr_segments = gdf[resource_mask & fsr_mask].copy()
+    
+    print(f"Found {len(fsr_segments)} FSR segments out of {len(gdf)} total segments")
+    print(f"Unique FSRs: {fsr_segments['ROAD_NAME_FULL'].nunique()}")
+    
+    return fsr_segments
 
-def explore_road_names(gdf, output_file="fsr_names.txt"):
-    """Explore and save potential FSR names"""
-    print("Exploring road names...")
+def explore_fsr_data(fsr_gdf, output_file="fsr_analysis.txt"):
+    """Analyze FSR data and save results"""
+    print("Analyzing FSR data...")
     
-    # Get all unique road names
-    unique_names = gdf['road_name'].dropna().unique()
-    print(f"Total unique road names: {len(unique_names)}")
+    # Get FSR statistics
+    fsr_names = fsr_gdf['ROAD_NAME_FULL'].unique()
+    segment_counts = fsr_gdf.groupby('ROAD_NAME_FULL').size()
     
-    # Find potential FSRs
-    potential_fsrs = [name for name in unique_names 
-                      if any(keyword in str(name).upper() 
-                            for keyword in ['FSR', 'FOREST', 'FORESTRY'])]
+    print(f"Found {len(fsr_names)} unique FSRs")
+    print(f"Total FSR segments: {len(fsr_gdf)}")
+    print(f"Average segments per FSR: {len(fsr_gdf) / len(fsr_names):.1f}")
     
-    print(f"Found {len(potential_fsrs)} potential FSR names")
-    
-    # Save to file for inspection
+    # Save detailed analysis
     with open(output_file, 'w') as f:
-        f.write("Potential FSR Names Found:\n")
-        f.write("=" * 40 + "\n")
-        for name in sorted(potential_fsrs):
+        f.write("BC FSR Analysis\n")
+        f.write("=" * 40 + "\n\n")
+        f.write(f"Total FSR segments: {len(fsr_gdf)}\n")
+        f.write(f"Unique FSRs: {len(fsr_names)}\n")
+        f.write(f"Average segments per FSR: {len(fsr_gdf) / len(fsr_names):.1f}\n\n")
+        
+        f.write("FSRs with most segments:\n")
+        f.write("-" * 30 + "\n")
+        top_fsrs = segment_counts.nlargest(20)
+        for fsr_name, count in top_fsrs.items():
+            f.write(f"{fsr_name}: {count} segments\n")
+        
+        f.write("\n\nAll FSR Names:\n")
+        f.write("-" * 20 + "\n")
+        for name in sorted(fsr_names):
             f.write(f"{name}\n")
     
-    print(f"FSR names saved to {output_file}")
+    print(f"Analysis saved to {output_file}")
     
-    # Show first 20 in console
-    print("\nFirst 20 potential FSR names:")
-    for name in sorted(potential_fsrs)[:20]:
-        print(f"  {name}")
+    # Show top FSRs in console
+    print("\nTop 10 FSRs by segment count:")
+    top_10 = segment_counts.nlargest(10)
+    for fsr_name, count in top_10.items():
+        print(f"  {fsr_name}: {count} segments")
     
-    return potential_fsrs
+    return segment_counts
 
-def merge_fsr_segments(gdf):
-    """Filter for FSRs and merge segments"""
-    print("\nFiltering for FSR roads...")
+def merge_fsr_segments(fsr_gdf):
+    """Efficiently merge FSR segments by road name"""
+    print("\nMerging FSR segments by ROAD_NAME_FULL...")
+    print("\n(duplicating ROAD_NAME_FULL attribute to title attribute for caltopo.)")
     
-    # Apply FSR filter
-    fsr_roads = gdf[gdf['road_name'].apply(is_fsr)].copy()
-    print(f"Found {len(fsr_roads)} FSR segments out of {len(gdf)} total segments")
-    
-    if len(fsr_roads) == 0:
-        print("No FSR roads found with current patterns!")
-        return None
-    
-    print("\nMerging FSR segments by road name...")
     merged_fsrs = []
     
-    for road_name, group in fsr_roads.groupby('road_name'):
-        # Merge contiguous segments of the same FSR
+    # Group by ROAD_NAME_FULL - this is O(N log N) where N is FSR segments only
+    for road_name, group in fsr_gdf.groupby('ROAD_NAME_FULL'):
         try:
-            merged_geom = linemerge(group.geometry.tolist())
+            # Get all geometries for this FSR
+            geometries = group.geometry.tolist()
+            
+            # Merge contiguous segments - linemerge handles the connectivity
+            merged_geom = linemerge(geometries)
+            
+            # Calculate some statistics
+            total_length = group.geometry.length.sum()
             
             merged_fsrs.append({
-                'road_name': road_name,
+                'title': road_name, # caltopo likes title 
+                'ROAD_NAME_FULL': road_name,  # but leave the BC attribute name also
+                'ROAD_CLASS': 'resource',  # All FSRs have this
                 'original_segments': len(group),
-                'total_length_m': group.geometry.length.sum(),
+                'total_length_m': total_length,
                 'geometry': merged_geom
             })
             
@@ -98,24 +108,26 @@ def merge_fsr_segments(gdf):
         print("No FSR segments could be merged!")
         return None
     
-    fsr_gdf = gpd.GeoDataFrame(merged_fsrs, crs=fsr_roads.crs)
+    # Create new GeoDataFrame with merged FSRs
+    result_gdf = gpd.GeoDataFrame(merged_fsrs, crs=fsr_gdf.crs)
     
-    print(f"Merged into {len(fsr_gdf)} unique FSR roads")
-    print(f"Average segments per FSR: {sum(f['original_segments'] for f in merged_fsrs) / len(merged_fsrs):.1f}")
+    total_original = sum(f['original_segments'] for f in merged_fsrs)
+    reduction_pct = ((total_original - len(result_gdf)) / total_original * 100)
     
-    return fsr_gdf
+    print(f"Merged {total_original} segments into {len(result_gdf)} FSR roads")
+    print(f"Reduction: {reduction_pct:.1f}%")
+    print(f"Average segments per FSR: {total_original / len(result_gdf):.1f}")
+    
+    return result_gdf
 
 def main():
     """Main execution function"""
     # Check for input file
     geojson_file = "bc_roads.geojson"
-    geojson_file = "DRA_DGTL_ROAD_ATLAS_MPAR_SP.geojson"
     
     if not Path(geojson_file).exists():
         print(f"Error: {geojson_file} not found!")
         print("Please download BC road data and save as 'bc_roads.geojson'")
-        print("You can download from BC Data Catalogue:")
-        print("https://catalogue.data.gov.bc.ca/dataset/digital-road-atlas-dra-demographic-partially-attributed-roads")
         return
     
     try:
@@ -127,15 +139,26 @@ def main():
         print(f"\nDataset columns: {list(gdf.columns)}")
         print(f"CRS: {gdf.crs}")
         
-        # Explore road names
-        potential_fsrs = explore_road_names(gdf)
-        
-        if not potential_fsrs:
-            print("No potential FSR roads found. Check the road name patterns.")
+        # Check for required columns
+        required_cols = ['ROAD_NAME_FULL', 'ROAD_CLASS']
+        missing_cols = [col for col in required_cols if col not in gdf.columns]
+        if missing_cols:
+            print(f"Error: Missing required columns: {missing_cols}")
+            print("Available columns:", list(gdf.columns))
             return
         
-        # Merge FSR segments
-        merged_fsrs = merge_fsr_segments(gdf)
+        # Filter for FSR segments only - this is the key optimization
+        fsr_segments = filter_fsr_segments(gdf)
+        
+        if len(fsr_segments) == 0:
+            print("No FSR segments found!")
+            return
+        
+        # Analyze FSR data
+        segment_counts = explore_fsr_data(fsr_segments)
+        
+        # Merge FSR segments - now only working with ~3000 segments instead of 50000
+        merged_fsrs = merge_fsr_segments(fsr_segments)
         
         if merged_fsrs is not None:
             # Save results
@@ -143,20 +166,22 @@ def main():
             merged_fsrs.to_file(output_file, driver='GeoJSON')
             print(f"\nMerged FSR roads saved to {output_file}")
             
-            # Show summary statistics
-            print("\nSummary Statistics:")
-            print(f"Total FSR roads: {len(merged_fsrs)}")
-            print(f"Total original segments: {merged_fsrs['original_segments'].sum()}")
-            print(f"Average reduction: {((merged_fsrs['original_segments'].sum() - len(merged_fsrs)) / merged_fsrs['original_segments'].sum() * 100):.1f}%")
+            # Show final statistics
+            print("\nFinal Results:")
+            print(f"Original FSR segments: {len(fsr_segments)}")
+            print(f"Merged FSR roads: {len(merged_fsrs)}")
+            print(f"Reduction: {((len(fsr_segments) - len(merged_fsrs)) / len(fsr_segments) * 100):.1f}%")
             
-            # Show top 10 FSRs by segment count
-            top_fsrs = merged_fsrs.nlargest(10, 'original_segments')
-            print(f"\nTop 10 FSRs by original segment count:")
+            # Show top 20 FSRs by segment count
+            top_fsrs = merged_fsrs.nlargest(20, 'original_segments')
+            print(f"\nTop 20 FSRs by original segment count:")
             for _, row in top_fsrs.iterrows():
-                print(f"  {row['road_name']}: {row['original_segments']} segments")
+                print(f"  {row['ROAD_NAME_FULL']}: {row['original_segments']} segments")
     
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
         return
 
 if __name__ == "__main__":
